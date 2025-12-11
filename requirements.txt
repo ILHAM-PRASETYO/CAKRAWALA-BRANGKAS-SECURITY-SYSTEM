@@ -9,4 +9,5 @@ Pillow
 librosa
 soundfile
 scikit-learn
+plotly
 opencv-python-headless
