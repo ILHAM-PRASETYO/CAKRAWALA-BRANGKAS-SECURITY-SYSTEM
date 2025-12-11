@@ -1,79 +1,102 @@
 import streamlit as st
 import paho.mqtt.client as mqtt
 import pandas as pd
-import numpy as np
-from datetime import datetime
 import time
+from datetime import datetime
 import json
 import threading
-import plotly.graph_objects as go 
-# import queue # Tidak digunakan, menggunakan list sederhana di session_state
+import plotly.graph_objects as go
+import numpy as np 
 
+# PENTING: Mengaktifkan Wide Layout
 st.set_page_config(layout="wide")
 
-MQTT_SERVER = "broker.hivemq.com" 
-MQTT_PORT = 1883
-
-# --- Topik (Subscription: Data dari ESP32/ML Server) ---
-TOPIC_STATUS_BRANKAS = "data/status/kontrol"
-TOPIC_DIST = "data/dist/kontrol"
-TOPIC_PIR = "data/pir/kontrol" 
-TOPIC_ML_FACE_RESULT = "ai/face/result"
-TOPIC_ML_VOICE_RESULT = "ai/voice/result"
-TOPIC_CAM_PHOTO_URL = "/iot/camera/photo"
-TOPIC_AUDIO_LINK = "data/audio/link"
-
-# --- Topik (Publication: Perintah ke ESP32/Camera) ---
-TOPIC_CAM_TRIGGER = "/iot/camera/trigger"
-TOPIC_ALARM_CONTROL = "data/alarm/kontrol"
 # ====================================================================
-# INISIALISASI STREAMLIT SESSION STATE (Tambahkan Antrian)
+# KONFIGURASI TOPIK MQTT
 # ====================================================================
-for key in ["df_face", "df_voice", "df_brankas"]:
-    if key not in st.session_state:
-        if key == "df_brankas":
-            st.session_state[key] = pd.DataFrame(columns=[
-                "Timestamp", "Status Brankas", "Jarak (cm)", "PIR", "Prediksi Wajah", "Prediksi Suara", "Label Prediksi"
-            ])
-        else:
-            st.session_state[key] = pd.DataFrame(columns=["Timestamp", "Hasil Prediksi", "Akurasi (%)", "Status", "Keterangan"])
 
-# Antrian untuk menyimpan pesan MQTT yang masuk dari thread
+mqtt_broker = "broker.hivemq.com"
+mqtt_port = 1883
+topic_brankas = "data/status/kontrol"
+topic_face = "ai/face/result"
+topic_voice = "ai/voice/result"
+topic_cam_url = "/iot/camera/photo"
+topic_dist = "data/dist/kontrol"
+topic_pir = "data/pir/kontrol"
+topic_alarm_control = "data/alarm/kontrol"
+topic_cam_trigger = "/iot/camera/trigger"
+topic_audio_link = "data/audio/link"
+
+# ====================================================================
+# INISIALISASI SESSION STATE (Hanya MQTT Data)
+# ====================================================================
+
 if 'mqtt_queue' not in st.session_state:
     st.session_state.mqtt_queue = [] 
 
-if 'last_face_time' not in st.session_state:
-    st.session_state.last_face_time = None
-# ... (sisa inisialisasi session_state tetap sama) ...
-if 'last_voice_time' not in st.session_state:
-    st.session_state.last_voice_time = None
+if 'data_brankas' not in st.session_state:
+    st.session_state.data_brankas = pd.DataFrame(columns=[
+        "Timestamp", "Status Brankas", "Jarak (cm)", "PIR", "Prediksi Wajah", "Prediksi Suara", "Label Prediksi"
+    ])
+# Dataframe Log ML sekarang 100% diisi dari MQTT
+if 'data_face' not in st.session_state:
+    st.session_state.data_face = pd.DataFrame(columns=["Timestamp", "Hasil Prediksi", "Status", "Keterangan"])
+if 'data_voice' not in st.session_state:
+    st.session_state.data_voice = pd.DataFrame(columns=["Timestamp", "Hasil Prediksi", "Status", "Keterangan"])
 
 if 'photo_url' not in st.session_state:
-    st.session_state.photo_url = "https://via.placeholder.com/640x480?text=No+Photo+Yet"
-
+    st.session_state.photo_url = "https://via.placeholder.com/640x480?text=Menunggu+Foto"
 if 'audio_url' not in st.session_state:
     st.session_state.audio_url = None
 
 # ====================================================================
-# FUNGSI CALLBACK MQTT (Hanya Menambahkan ke Antrian)
+# FUNGSI LOGIKA PREDIKSI GABUNGAN
 # ====================================================================
-def on_mqtt_message(client, userdata, msg):
+
+def generate_final_prediction(row):
+    # Logika Prediksi Gabungan tetap sama
+    wajah = row.get("Prediksi Wajah", "")
+    suara = row.get("Prediksi Suara", "")
+    jarak = row.get("Jarak (cm)", np.nan)
+    pir = row.get("PIR", np.nan)
+    status = row.get("Status Brankas", "")
+
+    if "Brangkas Dibuka Paksa" in status:
+        return "⚠ Dibobol!"
+    if wajah in ["Unknown", "OTHER_FACES"] or suara == "Not_User": 
+        return "🚨 Mencurigakan!"
+    if "Terbuka Secara Aman" in status:
+        return "✅ Sah & Aman"
+    if pd.notna(jarak) and jarak > 0 and jarak < 25: 
+        return "pintu brangkastertutup"
+    if pd.notna(pir) and pir == 1:
+        return "👀 Gerakan Terdeteksi"
+    return "✅ Aman"
+
+# ====================================================================
+# FUNGSI CALLBACK MQTT & PROSES ANTRIAN
+# ====================================================================
+
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        client.subscribe([
+            (topic_brankas, 0), (topic_face, 0), (topic_voice, 0), 
+            (topic_cam_url, 0), (topic_dist, 0), (topic_pir, 0), 
+            (topic_audio_link, 0)
+        ])
+
+def on_message(client, userdata, msg):
     try:
         payload = msg.payload.decode("utf-8").strip()
-        # Thread hanya menambahkan pesan ke antrian, TIDAK mengubah session_state
+        # Thread hanya menambahkan pesan ke antrian
         st.session_state.mqtt_queue.append({
             "topic": msg.topic,
             "payload": payload,
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         })
     except (UnicodeDecodeError, AttributeError):
-        # Jika ada error, logging sederhana di konsol
-        print(f"Error decoding MQTT payload from topic: {msg.topic}")
         pass
 
-# ====================================================================
-# FUNGSI BARU: MEMPROSES ANTRIAN (Dijalankan oleh Thread Utama)
-# ====================================================================
 def process_mqtt_queue():
     if not st.session_state.mqtt_queue:
         return
@@ -86,10 +109,8 @@ def process_mqtt_queue():
         payload = msg['payload']
         timestamp = msg['time']
         
-        # Logika pembaruan DataFrame harus diletakkan di sini,
-        # karena fungsi ini dipanggil oleh thread utama Streamlit.
-
-        if topic == TOPIC_STATUS_BRANKAS:
+        # --- LOGIKA UNTUK data_brankas (Sensor) ---
+        if topic == topic_brankas:
             new_row = {
                 "Timestamp": timestamp,
                 "Status Brankas": payload,
@@ -99,164 +120,97 @@ def process_mqtt_queue():
                 "Prediksi Suara": "Menunggu...",
                 "Label Prediksi": "Belum Diproses"
             }
-            st.session_state.df_brankas = pd.concat([
-                st.session_state.df_brankas, pd.DataFrame([new_row])
+            # Tambahkan baris baru
+            st.session_state.data_brankas = pd.concat([
+                st.session_state.data_brankas, pd.DataFrame([new_row])
             ], ignore_index=True)
             
-        elif not st.session_state.df_brankas.empty:
-            last_index = st.session_state.df_brankas.index[-1]
+        elif not st.session_state.data_brankas.empty:
+            last_index = st.session_state.data_brankas.index[-1]
             
-            # Update data sensor/ML/URL ke baris terakhir
-            if topic == TOPIC_DIST:
+            # Update data sensor di baris terakhir
+            if topic == topic_dist:
                 try:
-                    distance = float(payload)
-                    st.session_state.df_brankas.loc[last_index, 'Jarak (cm)'] = distance
-                except ValueError:
-                    pass
-
-            elif topic == TOPIC_PIR:
+                    st.session_state.data_brankas.loc[last_index, 'Jarak (cm)'] = float(payload)
+                except ValueError: pass
+            elif topic == topic_pir:
                 try:
-                    pir_val = int(payload)
-                    st.session_state.df_brankas.loc[last_index, 'PIR'] = pir_val
-                except ValueError:
-                    pass
-
-            elif topic == TOPIC_ML_FACE_RESULT:
-                st.session_state.df_brankas.loc[last_index, 'Prediksi Wajah'] = payload
-
-            elif topic == TOPIC_ML_VOICE_RESULT:
-                st.session_state.df_brankas.loc[last_index, 'Prediksi Suara'] = payload
+                    st.session_state.data_brankas.loc[last_index, 'PIR'] = int(payload)
+                except ValueError: pass
             
-        # Update state non-DataFrame
-        if topic == TOPIC_CAM_PHOTO_URL:
-            st.session_state.photo_url = f"{payload}?t={int(time.time())}"
+            # --- LOGIKA UNTUK ML HASIL & URL (Keputusan dari Web Server) ---
             
-        elif topic == TOPIC_AUDIO_LINK:
-            st.session_state.audio_url = f"{payload}?t={int(time.time())}" 
-            st.info(f"Link audio baru diterima: {st.session_state.audio_url}")
+            # Keputusan ML Wajah
+            elif topic == topic_face:
+                st.session_state.data_brankas.loc[last_index, 'Prediksi Wajah'] = payload
+                # Log ke dataframe face (Keputusan dari Web Server)
+                st.session_state.data_face = pd.concat([st.session_state.data_face, 
+                                                        pd.DataFrame([{"Timestamp": timestamp, "Hasil Prediksi": payload, "Status": "Success", "Keterangan": "MQTT Live Result"}])], ignore_index=True)
+            
+            # Keputusan ML Suara
+            elif topic == topic_voice:
+                st.session_state.data_brankas.loc[last_index, 'Prediksi Suara'] = payload
+                # Log ke dataframe voice (Keputusan dari Web Server)
+                st.session_state.data_voice = pd.concat([st.session_state.data_voice, 
+                                                         pd.DataFrame([{"Timestamp": timestamp, "Hasil Prediksi": payload, "Status": "Success", "Keterangan": "MQTT Live Result"}])], ignore_index=True)
+            
+            # URL Foto (Keputusan dari Web Server)
+            elif topic == topic_cam_url:
+                # Tambahkan timestamp di URL agar Streamlit memaksa reload gambar
+                st.session_state.photo_url = f"{payload}?t={int(time.time())}"
+            
+            # URL Audio (Keputusan dari Web Server)
+            elif topic == topic_audio_link:
+                st.session_state.audio_url = f"{payload}?t={int(time.time())}" 
+            
+    # Update label prediksi akhir
+    if not st.session_state.data_brankas.empty:
+        st.session_state.data_brankas["Label Prediksi"] = st.session_state.data_brankas.apply(
+            generate_final_prediction, axis=1
+        )
+        
 
 # ====================================================================
-# INISIALISASI & LOOP MQTT (TIDAK BERUBAH)
+# INISIALISASI KLIEN MQTT
 # ====================================================================
-# ... (Kode inisialisasi dan thread MQTT tetap sama) ...
 mqtt_client = mqtt.Client()
-mqtt_client.on_message = on_mqtt_message
-mqtt_client.connect(MQTT_SERVER, MQTT_PORT, 60) 
-mqtt_client.subscribe([
-    (TOPIC_STATUS_BRANKAS, 0),
-    (TOPIC_DIST, 0),
-    (TOPIC_PIR, 0),
-    (TOPIC_ML_FACE_RESULT, 0),
-    (TOPIC_ML_VOICE_RESULT, 0),
-    (TOPIC_CAM_PHOTO_URL, 0),
-    (TOPIC_AUDIO_LINK, 0)
-])
-
-def mqtt_loop():
-    mqtt_client.loop_forever()
-
-mqtt_thread = threading.Thread(target=mqtt_loop, daemon=True)
-mqtt_thread.start()
+mqtt_client.on_connect = on_connect
+mqtt_client.on_message = on_message
+mqtt_client.connect(mqtt_broker, mqtt_port, 60)
+mqtt_client.loop_start() 
 
 # ====================================================================
-# PENGOLAHAN LOG ML DAN PREDIKSI (TIDAK BERUBAH)
+# TAMPILAN DASHBOARD UTAMA
 # ====================================================================
-def load_new_ml_results():
-    try:
-        with open("results.json", "r") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return {"face": [], "voice": []}
 
-    new_face = []
-    new_voice = []
-
-    for item in data["face"]:
-        item_time = datetime.strptime(item["Timestamp"], "%Y-%m-%d %H:%M:%S")
-        if st.session_state.last_face_time is None or item_time > st.session_state.last_face_time:
-            new_face.append(item)
-
-    for item in data["voice"]:
-        item_time = datetime.strptime(item["Timestamp"], "%Y-%m-%d %H:%M:%S")
-        if st.session_state.last_voice_time is None or item_time > st.session_state.last_voice_time:
-            new_voice.append(item)
-
-    if new_face:
-        st.session_state.last_face_time = datetime.strptime(new_face[-1]["Timestamp"], "%Y-%m-%d %H:%M:%S")
-    if new_voice:
-        st.session_state.last_voice_time = datetime.strptime(new_voice[-1]["Timestamp"], "%Y-%m-%d %H:%M:%S")
-
-    return {"face": new_face, "voice": new_voice}
-new_results = load_new_ml_results()
-for item in new_results["face"]:
-    st.session_state.df_face = pd.concat([
-        st.session_state.df_face, pd.DataFrame([item])
-    ], ignore_index=True)
-for item in new_results["voice"]:
-    st.session_state.df_voice = pd.concat([
-        st.session_state.df_voice, pd.DataFrame([item])
-    ], ignore_index=True)
-
-# Update label prediksi di df_brankas
-if not st.session_state.df_brankas.empty:
-    st.session_state.df_brankas["Label Prediksi"] = st.session_state.df_brankas.apply(
-        generate_final_prediction, axis=1
-    )
-
-# ====================================================================
-# UI Dashboard
-# ====================================================================
-# ... (Kode UI yang sudah rapi tetap sama) ...
 st.title("🔒 Dashboard Monitoring Brankas & AI")
 
 # --- BAGIAN ATAS (CHART & FOTO) ---
 chart_col, photo_col = st.columns([2, 1])
 
-# ... (Konten chart_col dan photo_col, termasuk tombol kontrol, tetap sama) ...
 with chart_col:
     st.header("Live Chart (Jarak & PIR)")
-    df_plot = st.session_state.df_brankas.tail(200).copy()
-    
-    # Hapus baris dengan nilai NaN pada Jarak dan PIR agar chart bersih
+    # ... (Kode Chart Plotly tetap sama) ...
+    df_plot = st.session_state.data_brankas.tail(200).copy()
     df_plot.dropna(subset=['Jarak (cm)', 'PIR'], inplace=True) 
 
     if not df_plot.empty:
         fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=df_plot["Timestamp"], 
-            y=df_plot["Jarak (cm)"], 
-            mode="lines+markers", 
-            name="Jarak (cm)"
-        ))
-        
-        fig.add_trace(go.Scatter(
-            x=df_plot["Timestamp"], 
-            y=df_plot["PIR"], 
-            mode="lines+markers", 
-            name="PIR (Gerakan)", 
-            yaxis="y2"
-        ))
+        fig.add_trace(go.Scatter(x=df_plot["Timestamp"], y=df_plot["Jarak (cm)"], mode="lines+markers", name="Jarak (cm)"))
+        fig.add_trace(go.Scatter(x=df_plot["Timestamp"], y=df_plot["PIR"], mode="lines+markers", name="PIR (Gerakan)", yaxis="y2"))
 
         fig.update_layout(
             yaxis=dict(title="Jarak (cm)"),
-            yaxis2=dict(
-                title="PIR (0=Aman, 1=Gerak)", 
-                overlaying="y", 
-                side="right", 
-                showgrid=False,
-                range=[-0.1, 1.1] 
-            ),
+            yaxis2=dict(title="PIR (0=Aman, 1=Gerak)", overlaying="y", side="right", showgrid=False, range=[-0.1, 1.1]),
             height=520,
             legend=dict(x=0, y=1.1, orientation="h")
         )
-        
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Menunggu data Jarak/PIR untuk menampilkan chart.")
     
-    csv_data = st.session_state.df_brankas.to_csv(index=False).encode("utf-8")
-    is_data_available = not st.session_state.df_brankas.empty
+    csv_data = st.session_state.data_brankas.to_csv(index=False).encode("utf-8")
+    is_data_available = not st.session_state.data_brankas.empty
     
     if is_data_available:
         st.download_button(
@@ -271,6 +225,7 @@ with chart_col:
 
 with photo_col:
     st.header("Foto Terbaru")
+    # Tampilkan foto yang URL-nya dikirim dari Web Server ML
     st.image(st.session_state.photo_url, use_column_width=True)
     
     st.markdown("### Kontrol Cepat")
@@ -279,17 +234,17 @@ with photo_col:
     
     with control_col1:
         if st.button("📷 Ambil Foto"): 
-            mqtt_client.publish(TOPIC_CAM_TRIGGER, "capture")
+            mqtt_client.publish(topic_cam_trigger, "capture")
             
     with control_col2:
         if st.button("🔇 Matikan Alarm"):
-            mqtt_client.publish(TOPIC_ALARM_CONTROL, "OFF")
+            mqtt_client.publish(topic_alarm_control, "OFF")
             
     with control_col3:
         if st.button("🔄 Refresh Foto"):
-            st.session_state.photo_url = f"{st.session_state.photo_url.split('?')[0]}?t={int(time.time())}"
-
-
+            # Jika tombol refresh ditekan, kirim perintah trigger ke kamera
+            mqtt_client.publish(topic_cam_trigger, "capture")
+            
 st.markdown("---")
 
 # --- BAGIAN BAWAH (TAB UNTUK DETAIL LOG) ---
@@ -297,21 +252,22 @@ tab1, tab2, tab3 = st.tabs(["🏠 Detail Brankas", "🖼️ Log Prediksi Wajah",
 
 with tab1:
     st.subheader("Log Data Brankas Lengkap")
-    st.dataframe(st.session_state.df_brankas, use_container_width=True)
+    st.dataframe(st.session_state.data_brankas, use_container_width=True)
 
 with tab2:
-    st.subheader("Log Prediksi Wajah")
-    st.dataframe(st.session_state.df_face.tail(10), use_container_width=True)
+    st.subheader("Log Prediksi Wajah (Keputusan dari Web Server)")
+    st.dataframe(st.session_state.data_face.tail(10), use_container_width=True)
 
 with tab3:
     st.subheader("Audio Terbaru untuk Analisis")
+    # Tampilkan audio yang URL-nya dikirim dari Web Server ML
     if st.session_state.audio_url:
         st.audio(st.session_state.audio_url, format='audio/wav')
     else:
         st.info("Menunggu rekaman audio terbaru...")
 
-    st.subheader("Log Prediksi Suara")
-    st.dataframe(st.session_state.df_voice.tail(10), use_container_width=True)
+    st.subheader("Log Prediksi Suara (Keputusan dari Web Server)")
+    st.dataframe(st.session_state.data_voice.tail(10), use_container_width=True)
 
 
 # ====================================================================
