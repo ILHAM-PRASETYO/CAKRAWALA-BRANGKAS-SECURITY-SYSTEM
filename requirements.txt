@@ -1,0 +1,12 @@
+streamlit
+paho-mqtt
+pandas
+numpy
+fastapi
+uvicorn[standard]
+python-multipart
+Pillow
+librosa
+soundfile
+scikit-learn
+opencv-python-headless
