@@ -6,7 +6,8 @@ from datetime import datetime
 import json
 import threading
 import plotly.graph_objects as go
-import numpy as np 
+import numpy as np
+import os # Wajib ditambahkan untuk client ID unik
 
 # PENTING: Mengaktifkan Wide Layout
 st.set_page_config(layout="wide")
@@ -38,7 +39,6 @@ if 'data_brankas' not in st.session_state:
     st.session_state.data_brankas = pd.DataFrame(columns=[
         "Timestamp", "Status Brankas", "Jarak (cm)", "PIR", "Prediksi Wajah", "Prediksi Suara", "Label Prediksi"
     ])
-# Dataframe Log ML sekarang 100% diisi dari MQTT
 if 'data_face' not in st.session_state:
     st.session_state.data_face = pd.DataFrame(columns=["Timestamp", "Hasil Prediksi", "Status", "Keterangan"])
 if 'data_voice' not in st.session_state:
@@ -49,12 +49,14 @@ if 'photo_url' not in st.session_state:
 if 'audio_url' not in st.session_state:
     st.session_state.audio_url = None
 
+if 'last_refresh' not in st.session_state:
+    st.session_state.last_refresh = time.time()
+    
 # ====================================================================
 # FUNGSI LOGIKA PREDIKSI GABUNGAN
 # ====================================================================
 
 def generate_final_prediction(row):
-    # Logika Prediksi Gabungan tetap sama
     wajah = row.get("Prediksi Wajah", "")
     suara = row.get("Prediksi Suara", "")
     jarak = row.get("Jarak (cm)", np.nan)
@@ -67,7 +69,8 @@ def generate_final_prediction(row):
         return "🚨 Mencurigakan!"
     if "Terbuka Secara Aman" in status:
         return "✅ Sah & Aman"
-    if pd.notna(jarak) and jarak > 0 and jarak < 25: 
+    # Diperbaiki: Cek jika jarak adalah float yang valid
+    if pd.notna(jarak) and isinstance(jarak, (int, float)) and jarak > 0 and jarak < 25: 
         return "pintu brangkastertutup"
     if pd.notna(pir) and pir == 1:
         return "👀 Gerakan Terdeteksi"
@@ -84,11 +87,15 @@ def on_connect(client, userdata, flags, rc):
             (topic_cam_url, 0), (topic_dist, 0), (topic_pir, 0), 
             (topic_audio_link, 0)
         ])
+        st.info("✅ Klien MQTT Terkoneksi & Berhasil Berlangganan Topik.")
+    else:
+        st.error(f"❌ Koneksi MQTT Gagal, kode: {rc}")
+
 
 def on_message(client, userdata, msg):
     try:
         payload = msg.payload.decode("utf-8").strip()
-        # Thread hanya menambahkan pesan ke antrian
+        # Thread hanya menambahkan pesan ke antrian (aman)
         st.session_state.mqtt_queue.append({
             "topic": msg.topic,
             "payload": payload,
@@ -97,6 +104,33 @@ def on_message(client, userdata, msg):
     except (UnicodeDecodeError, AttributeError):
         pass
 
+# ====================================================================
+# INISIALISASI KLIEN MQTT DENGAN CACHE (SOLUSI UNTUK OSERROR: TOO MANY OPEN FILES)
+# ====================================================================
+
+@st.cache_resource # <--- DEKORATOR WAJIB!
+def get_mqtt_client(broker, port):
+    """Membuat, menghubungkan, dan memulai loop klien MQTT hanya sekali."""
+    client_id = f"StreamlitDashboard-{os.getpid()}-{int(time.time())}" # ID unik
+    
+    try:
+        client = mqtt.Client(client_id=client_id, clean_session=True)
+        client.on_connect = on_connect
+        client.on_message = on_message
+        
+        # Coba koneksi
+        client.connect(broker, port, 60)
+        client.loop_start() 
+        return client
+
+    except Exception as e:
+        # Jika koneksi gagal, kembalikan None
+        st.error(f"FATAL: Gagal koneksi MQTT saat inisialisasi: {e}")
+        return None 
+
+# ====================================================================
+# PROSES ANTRIAN DI THREAD UTAMA STREAMLIT
+# ====================================================================
 def process_mqtt_queue():
     if not st.session_state.mqtt_queue:
         return
@@ -104,6 +138,8 @@ def process_mqtt_queue():
     messages_to_process = list(st.session_state.mqtt_queue)
     st.session_state.mqtt_queue = [] # Kosongkan antrian
 
+    should_rerun = False
+    
     for msg in messages_to_process:
         topic = msg['topic']
         payload = msg['payload']
@@ -124,6 +160,7 @@ def process_mqtt_queue():
             st.session_state.data_brankas = pd.concat([
                 st.session_state.data_brankas, pd.DataFrame([new_row])
             ], ignore_index=True)
+            should_rerun = True # Data baru, harus refresh
             
         elif not st.session_state.data_brankas.empty:
             last_index = st.session_state.data_brankas.index[-1]
@@ -132,56 +169,53 @@ def process_mqtt_queue():
             if topic == topic_dist:
                 try:
                     st.session_state.data_brankas.loc[last_index, 'Jarak (cm)'] = float(payload)
+                    should_rerun = True
                 except ValueError: pass
             elif topic == topic_pir:
                 try:
                     st.session_state.data_brankas.loc[last_index, 'PIR'] = int(payload)
+                    should_rerun = True
                 except ValueError: pass
             
-            # --- LOGIKA UNTUK ML HASIL & URL (Keputusan dari Web Server) ---
-            
-            # Keputusan ML Wajah
+            # --- LOGIKA UNTUK ML HASIL & URL ---
             elif topic == topic_face:
                 st.session_state.data_brankas.loc[last_index, 'Prediksi Wajah'] = payload
-                # Log ke dataframe face (Keputusan dari Web Server)
                 st.session_state.data_face = pd.concat([st.session_state.data_face, 
-                                                        pd.DataFrame([{"Timestamp": timestamp, "Hasil Prediksi": payload, "Status": "Success", "Keterangan": "MQTT Live Result"}])], ignore_index=True)
+                                                         pd.DataFrame([{"Timestamp": timestamp, "Hasil Prediksi": payload, "Status": "Success", "Keterangan": "MQTT Live Result"}])], ignore_index=True)
+                should_rerun = True
             
-            # Keputusan ML Suara
             elif topic == topic_voice:
                 st.session_state.data_brankas.loc[last_index, 'Prediksi Suara'] = payload
-                # Log ke dataframe voice (Keputusan dari Web Server)
                 st.session_state.data_voice = pd.concat([st.session_state.data_voice, 
-                                                         pd.DataFrame([{"Timestamp": timestamp, "Hasil Prediksi": payload, "Status": "Success", "Keterangan": "MQTT Live Result"}])], ignore_index=True)
+                                                          pd.DataFrame([{"Timestamp": timestamp, "Hasil Prediksi": payload, "Status": "Success", "Keterangan": "MQTT Live Result"}])], ignore_index=True)
+                should_rerun = True
             
-            # URL Foto (Keputusan dari Web Server)
             elif topic == topic_cam_url:
-                # Tambahkan timestamp di URL agar Streamlit memaksa reload gambar
                 st.session_state.photo_url = f"{payload}?t={int(time.time())}"
+                should_rerun = True
             
-            # URL Audio (Keputusan dari Web Server)
             elif topic == topic_audio_link:
                 st.session_state.audio_url = f"{payload}?t={int(time.time())}" 
-            
-    # Update label prediksi akhir
+                should_rerun = True
+
+    # Update label prediksi akhir (Dilakukan setelah semua update loc)
     if not st.session_state.data_brankas.empty:
         st.session_state.data_brankas["Label Prediksi"] = st.session_state.data_brankas.apply(
             generate_final_prediction, axis=1
         )
         
-
-# ====================================================================
-# INISIALISASI KLIEN MQTT
-# ====================================================================
-mqtt_client = mqtt.Client()
-mqtt_client.on_connect = on_connect
-mqtt_client.on_message = on_message
-mqtt_client.connect(mqtt_broker, mqtt_port, 60)
-mqtt_client.loop_start() 
+    return should_rerun # Mengembalikan apakah Streamlit harus di-rerun
 
 # ====================================================================
 # TAMPILAN DASHBOARD UTAMA
 # ====================================================================
+
+# 1. Panggil klien MQTT yang di-cache (Hanya sekali)
+mqtt_client = get_mqtt_client(mqtt_broker, mqtt_port)
+
+if not mqtt_client:
+    st.error("Dashboard tidak dapat terhubung ke MQTT Broker. Mohon periksa konfigurasi dan pastikan broker online.")
+    st.stop() # Hentikan eksekusi jika gagal
 
 st.title("🔒 Dashboard Monitoring Brankas & AI")
 
@@ -190,7 +224,6 @@ chart_col, photo_col = st.columns([2, 1])
 
 with chart_col:
     st.header("Live Chart (Jarak & PIR)")
-    # ... (Kode Chart Plotly tetap sama) ...
     df_plot = st.session_state.data_brankas.tail(200).copy()
     df_plot.dropna(subset=['Jarak (cm)', 'PIR'], inplace=True) 
 
@@ -225,7 +258,6 @@ with chart_col:
 
 with photo_col:
     st.header("Foto Terbaru")
-    # Tampilkan foto yang URL-nya dikirim dari Web Server ML
     st.image(st.session_state.photo_url, use_column_width=True)
     
     st.markdown("### Kontrol Cepat")
@@ -242,7 +274,6 @@ with photo_col:
             
     with control_col3:
         if st.button("🔄 Refresh Foto"):
-            # Jika tombol refresh ditekan, kirim perintah trigger ke kamera
             mqtt_client.publish(topic_cam_trigger, "capture")
             
 st.markdown("---")
@@ -260,7 +291,6 @@ with tab2:
 
 with tab3:
     st.subheader("Audio Terbaru untuk Analisis")
-    # Tampilkan audio yang URL-nya dikirim dari Web Server ML
     if st.session_state.audio_url:
         st.audio(st.session_state.audio_url, format='audio/wav')
     else:
@@ -271,10 +301,14 @@ with tab3:
 
 
 # ====================================================================
-# PENTING: PROSES ANTRIAN SEBELUM RERUN
+# PENTING: PENGATURAN REFRESH OTOMATIS BERDASARKAN DATA BARU
 # ====================================================================
-process_mqtt_queue()
 
-# Refresh otomatis
-time.sleep(2)
-st.rerun()
+# 1. Proses semua pesan di antrian
+should_rerun = process_mqtt_queue()
+
+# 2. Cek apakah ada data baru atau waktu refresh berkala telah tiba
+# Refresh jika ada data MQTT baru ATAU jika 5 detik telah berlalu (untuk update status umum)
+if should_rerun or (time.time() - st.session_state.last_refresh > 5): 
+    st.session_state.last_refresh = time.time()
+    st.rerun()
