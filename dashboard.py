@@ -12,6 +12,8 @@ from PIL import Image # <-- Tambahkan import PIL.Image
 import queue
 import librosa
 from io import BytesIO
+import json
+#import subprocess
 
 # ====================================================================
 # KONFIGURASI HALAMAN & LAYOUT
@@ -29,9 +31,7 @@ TOPIC_FACE_RESULT = "ai/face/result"
 TOPIC_VOICE_RESULT = "ai/voice/result"
 TOPIC_CAM_URL = "iot/camera/photo" 
 TOPIC_AUDIO_LINK = "data/audio/link" 
-TOPIC_DIST = "data/dist/kontrol"
-TOPIC_PIR = "data/pir/kontrol"
-TOPIC_ALARM = "data/Allert/kontrol"
+TOPIC_ALARM = "data/alarm/kontrol"
 TOPIC_CAM_TRIGGER = "data/cam/capture" 
 TOPIC_REC_TRIGGER = "data/mic/trigger" 
 
@@ -221,8 +221,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         client.subscribe([
             (TOPIC_BRANKAS, 0), (TOPIC_FACE_RESULT, 0), (TOPIC_VOICE_RESULT, 0), 
-            (TOPIC_CAM_URL, 0), (TOPIC_DIST, 0), (TOPIC_PIR, 0), 
-            (TOPIC_AUDIO_LINK, 0)
+            (TOPIC_CAM_URL, 0),(TOPIC_AUDIO_LINK, 0)
         ])
         print('✅ MQTT Connected')
 
@@ -267,24 +266,19 @@ def get_mqtt_client_cached():
 # BAGIAN 4: PROSES ANTRIAN DATA (FUNGSI UTAMA)
 # ====================================================================
 def process_queue_and_logic():
-    # Ambil internal queue yang thread-safe
     internal_queue = st.session_state.mqtt_internal_queue
-    
     messages = []
     data_updated = False
 
-    # AMBIL SEMUA PESAN DARI INTERNAL QUEUE MENGGUNAKAN GET_NOWAIT()
+    # Ambil pesan dari queue
     while not internal_queue.empty():
         try:
-             # get_nowait() adalah cara non-blocking yang benar untuk mengambil dari Queue
              messages.append(internal_queue.get_nowait()) 
              data_updated = True 
         except queue.Empty:
-             # Seharusnya tidak terjadi, tapi ini adalah catch-all yang aman.
              break
 
-    if not messages:
-        return False # Tidak ada update
+    if not messages: return False 
 
     client = get_mqtt_client_cached()
 
@@ -293,71 +287,100 @@ def process_queue_and_logic():
         payload = msg['payload']
         timestamp = msg['time']
         
-        # --- LOGIKA SENSOR ---
-        if topic == TOPIC_BRANKAS:
-            # Entry baru untuk status brankas (Baris baru)
-            new_row = {"Timestamp": timestamp, "Status Brankas": payload, "Jarak (cm)": np.nan, "PIR": np.nan, "Prediksi Wajah": "...", "Prediksi Suara": "...", "Label Prediksi": "Belum Diproses"}
-            st.session_state.data_brankas = pd.concat([st.session_state.data_brankas, pd.DataFrame([new_row])], ignore_index=True)
-            data_updated = True
-            
+        # --- LOGIKA UTAMA: PARSING JSON DARI SATU TOPIK ---
+        if topic == TOPIC_BRANKAS: 
+            # Kita asumsikan payload adalah JSON: {"status": "...", "jarak": 10, "pir": 1}
+            try:
+                # Coba parse sebagai JSON
+                data_json = json.loads(payload)
+                
+                status_val = data_json.get("status", "Unknown")
+                jarak_val = float(data_json.get("jarak", 0))
+                pir_val = int(data_json.get("pir", 0))
+                
+                # Masukkan langsung ke baris baru (Semua data sinkron!)
+                new_row = {
+                    "Timestamp": timestamp, 
+                    "Status Brankas": status_val, 
+                    "Jarak (cm)": jarak_val, 
+                    "PIR": pir_val, 
+                    "Prediksi Wajah": "N/A", 
+                    "Prediksi Suara": "N/A", 
+                    "Label Prediksi": "Belum Diproses"
+                }
+                
+                # Tambahkan ke DataFrame
+                st.session_state.data_brankas = pd.concat(
+                    [st.session_state.data_brankas, pd.DataFrame([new_row])], 
+                    ignore_index=True
+                )
+                data_updated = True
+                
+            except json.JSONDecodeError:
+                # Fallback jika ESP32 mengirim string biasa (bukan JSON)
+                # Berguna saat transisi atau debug
+                new_row = {
+                    "Timestamp": timestamp, 
+                    "Status Brankas": payload, # Anggap payload string status
+                    "Jarak (cm)": np.nan, 
+                    "PIR": np.nan, 
+                    "Prediksi Wajah": "N/A", 
+                    "Prediksi Suara": "N/A", 
+                    "Label Prediksi": "Format Salah"
+                }
+                st.session_state.data_brankas = pd.concat([st.session_state.data_brankas, pd.DataFrame([new_row])], ignore_index=True)
+                data_updated = True
+
+        # --- LOGIKA MEDIA & HASIL ML (TETAP SAMA) ---
         elif not st.session_state.data_brankas.empty:
-            # Update data sensor ke baris terakhir
             last_idx = st.session_state.data_brankas.index[-1]
             
-            if topic == TOPIC_DIST:
-                try: 
-                    st.session_state.data_brankas.loc[last_idx, 'Jarak (cm)'] = float(payload)
-                except: 
-                    pass 
-                data_updated = True
-            elif topic == TOPIC_PIR:
-                try: 
-                    st.session_state.data_brankas.loc[last_idx, 'PIR'] = int(payload)
-                except: 
-                    pass 
-                data_updated = True
-            
-            # --- LOGIKA ML RESULT (Hasil yang sudah jadi) ---
-            elif topic == TOPIC_FACE_RESULT:
+            # Jika Hasil ML Wajah datang dari fungsi download_and_process_media
+            if topic == TOPIC_FACE_RESULT:
                 st.session_state.data_brankas.loc[last_idx, 'Prediksi Wajah'] = payload
                 st.session_state.data_face = pd.concat([st.session_state.data_face, pd.DataFrame([{"Timestamp": timestamp, "Hasil Prediksi": payload, "Status": "Success", "Keterangan": "MQTT"}])], ignore_index=True)
                 data_updated = True
+                
+            # Jika Hasil ML Suara datang
             elif topic == TOPIC_VOICE_RESULT:
                 st.session_state.data_brankas.loc[last_idx, 'Prediksi Suara'] = payload
                 st.session_state.data_voice = pd.concat([st.session_state.data_voice, pd.DataFrame([{"Timestamp": timestamp, "Hasil Prediksi": payload, "Status": "Success", "Keterangan": "MQTT"}])], ignore_index=True)
                 data_updated = True
 
-            # --- LOGIKA PENGGANTI WEB SERVER (URL HANDLING) ---
+            # Jika URL Kamera Masuk -> Trigger Download & Prediksi
             elif topic == TOPIC_CAM_URL:
                 st.session_state.photo_url = f"{payload}?t={int(time.time())}"
                 data_updated = True
+                # PENTING: Ini memicu ML Wajah
                 download_and_process_media(payload, "picture", client) 
 
+            # Jika URL Audio Masuk -> Trigger Download & Prediksi
             elif topic == TOPIC_AUDIO_LINK:
                 st.session_state.audio_url = f"{payload}?t={int(time.time())}"
                 data_updated = True
+                # PENTING: Ini memicu ML Suara
                 download_and_process_media(payload, "voice", client) 
 
-    # Update Logika Prediksi Akhir
+    # --- LOGIKA LABEL PREDIKSI AKHIR (TETAP SAMA) ---
     if not st.session_state.data_brankas.empty:
         # PENTING: Hitung ulang label prediksi setelah semua update
         def final_pred(row):
-            w = row.get("Prediksi Wajah", "...")
-            s = row.get("Prediksi Suara", "...")
+            w = row.get("Prediksi Wajah", "N/A")
+            s = row.get("Prediksi Suara", "N/A")
             
             # Logika Prioritas:
             stt = row.get("Status Brankas", "")
-            if "Dibuka Paksa" in stt: return "🚨 DIBOBOL!"
+            if "Brangkas Dibuka Paksa" in stt: return "🚨 DIBOBOL!"
             
             # Cek status sensor 
             p = row.get("PIR", np.nan)
             j = row.get("Jarak (cm)", np.nan)
             
             # --- Tambahan: Cek Data Sensor Belum Lengkap ---
-            if pd.isna(j) or pd.isna(p) or w == "..." or s == "...":
+            if pd.isna(j) or pd.isna(p) or w == "N/A" or s == "N/A":
                  # Cek apakah hanya sensor yang belum lengkap (karena sensor bisa datang terpisah)
                  if stt in ["AMAN", "STANDBY", "TERKUNCI"]:
-                    return "🔄 PENDING/DATA SENSOR TIDAK LENGKAP"
+                    return "🔄 N/A atau DATA SENSOR TIDAK LENGKAP"
                  else:
                     return stt # Pertahankan status ALERT dari ESP32 jika datanya belum lengkap
             
@@ -376,13 +399,20 @@ def process_queue_and_logic():
             # Asumsi: Hanya menerima jika Wajah dan Suara adalah Valid User
             if w in CLASS_NAMES_FACE[:4] and s == "MY_YES":
                 return "✅ ACCEPTED"
+            if w == "N/A" or s == "N/A":
+                if stt in ["AMAN", "STANDBY", "TERKUNCI"]:
+                    return "🔄 PENDING/MENUNGGU HASIL ML" # <-- Ubah label sedikit biar lebih jelas
+                else:
+                    return stt
             
             # Default
             return "✅ STANDBY"
             
         st.session_state.data_brankas["Label Prediksi"] = st.session_state.data_brankas.apply(final_pred, axis=1)
 
-    return data_updated
+    return data_updated 
+
+    # Update Logika Prediksi Akhir
 
 
 
