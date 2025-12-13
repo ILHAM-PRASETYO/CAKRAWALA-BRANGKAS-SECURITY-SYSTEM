@@ -54,7 +54,9 @@ def download_models_from_gdrive():
             gdown.download(id=GD_MODEL_IMAGE_ID, output='image_scaler.pkl', quiet=False)
         except Exception as e:
             print(f"Gagal mengunduh image_scaler.pkl: {e}")
-            
+
+download_models_from_gdrive()
+
 if 'mqtt_internal_queue' not in st.session_state: 
     st.session_state.mqtt_internal_queue = queue.Queue()
 
@@ -444,3 +446,4 @@ with t2:
 if has_update or (time.time() - st.session_state.last_refresh > 3):
     st.session_state.last_refresh = time.time()
     st.rerun()
+
