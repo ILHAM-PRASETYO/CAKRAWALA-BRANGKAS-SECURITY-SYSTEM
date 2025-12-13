@@ -452,24 +452,24 @@ with col1:
             yaxis2=dict(title="PIR (1=Gerak)", overlaying="y", side="right", range=[-0.1, 1.1], tickvals=[0, 1]),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     else:
         st.info("Menunggu data sensor untuk membuat grafik...")
 
 with col2:
     st.subheader("📸 Media & Kontrol")
-    # DEP_FIX: use_column_width deprecated. Ganti dengan use_container_width=True atau width=None
-    st.image(st.session_state.photo_url, caption="Foto dari Kamera Terakhir", use_container_width=True)
+    # DEP_FIX: use_column_width deprecated. Ganti dengan width='stretch' atau width=None
+    st.image(st.session_state.photo_url, caption="Foto dari Kamera Terakhir", width='stretch')
     
     c1, c2, c3 = st.columns(3)
     # Kontrol
-    if c1.button("📷 FOTO", help="Memicu ESP32 untuk mengambil foto", use_container_width=True): mqtt_client.publish(TOPIC_CAM_TRIGGER, "capture")
-    if c2.button("🎤 VOICE", help="Memicu ESP32 untuk merekam/kirim audio", use_container_width=True): mqtt_client.publish(TOPIC_REC_TRIGGER, "trigger")
-    if c3.button("🔇 OFF ALARM", help="Mematikan Alarm/Buzzer", use_container_width=True): mqtt_client.publish(TOPIC_ALARM, "OFF")
+    if c1.button("📷 FOTO", help="Memicu ESP32 untuk mengambil foto", width='stretch'): mqtt_client.publish(TOPIC_CAM_TRIGGER, "capture")
+    if c2.button("🎤 VOICE", help="Memicu ESP32 untuk merekam/kirim audio", width='stretch'): mqtt_client.publish(TOPIC_REC_TRIGGER, "trigger")
+    if c3.button("🔇 OFF ALARM", help="Mematikan Alarm/Buzzer", width='stretch'): mqtt_client.publish(TOPIC_ALARM, "OFF")
 
     col_reset, col_kontroll = st.columns(2)
-    if col_reset.button("🔄 RESET", help="Reset/Clear Status di ESP32", use_container_width=True): mqtt_client.publish(TOPIC_BRANKAS, "RESET")
-    if col_kontroll.button("OPEN", help="Memicu Open", use_container_width=True): mqtt_client.publish(TOPIC_BRANKAS, "OPEN")
+    if col_reset.button("🔄 RESET", help="Reset/Clear Status di ESP32", width='stretch'): mqtt_client.publish(TOPIC_BRANKAS, "RESET")
+    if col_kontroll.button("OPEN", help="Memicu Open", width='stretch'): mqtt_client.publish(TOPIC_BRANKAS, "OPEN")
     
     st.markdown("---")
     st.write("🔊 Audio Terakhir:")
@@ -500,3 +500,4 @@ if has_update or (time.time() - st.session_state.last_refresh > 3):
     st.session_state.last_refresh = time.time()
     # Panggil rerun() di Streamlit untuk memperbarui UI
     st.rerun()
+
